@@ -2,10 +2,13 @@ import base64
 
 from mcp.server import FastMCP
 from typing import Dict, Any, Union, Optional, List  # For type hinting dicts
+import os
 import httpx
 import sys
 import logging
-from urllib.parse import urlencode
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
 from .models import (
     AccountInfo,
@@ -18,7 +21,7 @@ from .models import (
 DATA_CENTERS = {
     "US_WEST": "https://api.us-west-1.saucelabs.com/",
     "US_EAST": "https://api.us-east-4.saucelabs.com/",
-    "EU_CENTRAL": "https://api.eu-central-1.saucelabs.com/",
+    "EU_CENTRAL": "https://api.eu-central-1.saucelabs.com/"
 }
 
 logging.basicConfig(
@@ -27,21 +30,19 @@ logging.basicConfig(
     format=">>>>>>>>>>>>%(levelname)s: %(message)s",
 )
 
+class ToolExecutionRequest(BaseModel):
+    tool_name: str
+    parameters: Dict[str, Any]
+
 class SauceLabsAgent:
     def __init__(
         self,
         mcp_server: FastMCP,
-        access_key: str,
-        username: str,
         region: str = "US_WEST",
     ):
 
         self.mcp = mcp_server
 
-        self.username = username
-        auth = httpx.BasicAuth(username, access_key)
-
-        base_url = ""
         if region.upper() == "OTHER":
             base_url = os.getenv("ALTERNATE_URL")
             if not base_url:
@@ -52,10 +53,10 @@ class SauceLabsAgent:
             # Fallback to the dictionary for all other regions
             base_url = DATA_CENTERS[region]
 
-        self.client = httpx.AsyncClient(base_url=base_url, auth=auth)
+        self.client = httpx.AsyncClient(base_url=base_url)
 
         ## Resources
-        self.mcp.resource("sauce://account")(self.account_info)
+        # self.mcp.resource("sauce://account")(self.account_info)
 
         ## Tools
         ### Accounts
@@ -104,7 +105,7 @@ class SauceLabsAgent:
 
     # Not exposed to the Agent
     async def sauce_api_call(
-            self, relative_endpoint: str, method: str = "GET", params: Optional[dict] = None
+            self, relative_endpoint: str, method: str = "GET", params: Optional[dict] = None, headers: Optional[dict] = None
     ) -> Union[httpx.Response, dict[str, str]]:
         try:
             # Always add the ai parameter
@@ -114,7 +115,8 @@ class SauceLabsAgent:
             response = await self.client.request(
                 method,
                 relative_endpoint,
-                params=all_params
+                params=all_params,
+                headers=headers
             )
             response.raise_for_status()
             return response
@@ -150,32 +152,35 @@ class SauceLabsAgent:
 
     ################################## Account endpoints
     # This method populates the Resource at sauce://account
-    async def account_info(self) -> Union[AccountInfo, Dict[str, str]]:
+    async def account_info(self, auth: str, username: str) -> Union[AccountInfo, Dict[str, str]]:
         """
         Retrieves detailed account information for the user associated with this client.
         Refer to `SauceAPI.resource_manifest['account']['methods']['get_account_info']` for full documentation.
+        :param username: Required. The unique identifier of user. Used to search user's account information.
         """
         response = await self.sauce_api_call(
             f"team-management/v1/users",
-            params={"username": self.username}
+            params={"username": username},
+            headers={"Authorization": auth},
         )
 
         if isinstance(response, httpx.Response):
-            # return response.json()
             return AccountInfo.model_validate(response.json())
         return response
 
-    async def get_account_info(self) -> Union[AccountInfo, Dict[str, str]]:
+    async def get_account_info(self, auth: str, username: str) -> Union[AccountInfo, Dict[str, str]]:
         """
         Provides the current user's Sauce Labs account information,
         including username, jobs run, minutes used, and overall account status.
         Useful for a quick overview of account activity.
+        :param username: Required. The unique identifier of user. Used to search user's account information.
         """
-        account_data = await self.account_info()
+        account_data = await self.account_info(auth, username)
         return account_data
 
     async def lookup_teams(
             self,
+            auth: str,
             id: Optional[str] = None,
             name: Optional[str] = None,
     ) -> Union[LookupTeamsResponse, ErrorResponse]:
@@ -197,19 +202,25 @@ class SauceLabsAgent:
 
         response = await self.sauce_api_call(
             f"team-management/v1/teams",
-            params=params
+            params=params,
+            headers={
+                "Authorization": auth
+            }
         )
         if isinstance(response, httpx.Response):
             return LookupTeamsResponse.model_validate(response.json())
         return ErrorResponse(error=response['error'])
 
-    async def get_team(self, id: str) -> Dict[str, Any]:
+    async def get_team(self, auth: str, id: str) -> Dict[str, Any]:
         """
         Returns the full profile of the specified team. The ID of the team is the only valid unique identifier.
         :param id: Required. The unique identifier of the team. You can look up the IDs of teams in your organization
             using the Lookup Teams endpoint.
         """
-        response = await self.sauce_api_call(f"team-management/v1/teams/{id}")
+        response = await self.sauce_api_call(f"team-management/v1/teams/{id}",
+            headers={
+                "Authorization": auth
+        })
         if response.status_code == 404:
             return {
                 "error": f"Team not found: {id}",
@@ -227,16 +238,19 @@ class SauceLabsAgent:
             }
         return response.json()
 
-    async def list_team_members(self, id: str) -> Dict[str, Any]:
+    async def list_team_members(self, auth: str, id: str) -> Dict[str, Any]:
         """
         Returns the number of members in the specified team and lists each member.
         :param id: Required. Identifies the team for which you are requesting the list of members.
         """
-        response = await self.sauce_api_call(f"team-management/v1/teams/{id}/members/")
+        response = await self.sauce_api_call(f"team-management/v1/teams/{id}/members/",  headers={
+            "Authorization": auth
+        })
         return response.json()
 
     async def lookup_users(
         self,
+        auth: str,
         id: Optional[str] = None,
         username: Optional[str] = None,
         teams: Optional[str] = None,
@@ -284,16 +298,21 @@ class SauceLabsAgent:
 
         response = await self.sauce_api_call(
             "team-management/v1/users",  # Clean endpoint without query string
-            params=params  # Pass parameters as dict
+            params=params,  # Pass parameters as dict
+            headers={
+                "Authorization": auth
+            }
         )
         return LookupUsers.model_validate(response.json())
 
-    async def get_user(self, id: str) -> Dict[str, Any]:
+    async def get_user(self, auth: str, id: str) -> Dict[str, Any]:
         """
         Returns the full profile of the specified user. The ID of the user is the only valid unique identifier.
         :param id: Required. The user's unique identifier. Specific user IDs can be obtained through the lookup_users Tool
         """
-        response = await self.sauce_api_call(f"team-management/v1/users/{id}/")
+        response = await self.sauce_api_call(f"team-management/v1/users/{id}/",  headers={
+            "Authorization": auth
+        })
         if response.status_code == 404:
             return {
                 "error": f"User not found: {id}",
@@ -311,15 +330,18 @@ class SauceLabsAgent:
             }
         return response.json()
 
-    async def get_my_active_team(self) -> Dict[str, Any]:
+    async def get_my_active_team(self, auth: str) -> Dict[str, Any]:
         """
         Retrieves the Sauce Labs active team for the currently authenticated user.
         """
-        response = await self.sauce_api_call("team-management/v1/users/me/active-team/")
+        response = await self.sauce_api_call("team-management/v1/users/me/active-team/",  headers={
+            "Authorization": auth
+        })
         return response.json()
 
     async def lookup_service_accounts(
         self,
+        auth: str,
         id: Optional[str] = None,
         username: Optional[str] = None,
         teams: Optional[str] = None,
@@ -349,10 +371,12 @@ class SauceLabsAgent:
         if offset:
             params["offset"] = offset
 
-        response = await self.sauce_api_call(f"team-management/v1/service-accounts", params=params)
+        response = await self.sauce_api_call(f"team-management/v1/service-accounts", params=params,  headers={
+            "Authorization": auth
+        })
         return LookupServiceAccounts.model_validate(response.json())
 
-    async def get_service_account(self, id: str) -> Dict[str, Any]:
+    async def get_service_account(self, auth: str, id: str) -> Dict[str, Any]:
         """
         Retrieves details of the specified service account.
         :param id: Required. The unique identifier of the service account. You can find the uuid in the URL of the
@@ -360,7 +384,9 @@ class SauceLabsAgent:
             Service Accounts endpoint.
         """
         response = await self.sauce_api_call(
-            f"team-management/v1/service-accounts/{id}/"
+            f"team-management/v1/service-accounts/{id}/",  headers={
+                "Authorization": auth
+            }
         )
         if response.status_code == 404:
             return {
@@ -381,8 +407,8 @@ class SauceLabsAgent:
 
     ################################## Jobs endpoints
     # Not exposed to the Agent. We can register if we need to, but it seems better to use the helper method.
-    async def get_asset_url(self, job_id: str, asset_key: str) -> str:
-        asset_list = await self.get_test_assets(job_id)
+    async def get_asset_url(self, auth: str, job_id: str, asset_key: str, username: str) -> str:
+        asset_list = await self.get_test_assets(auth, job_id)
 
         if isinstance(asset_list, dict) and "error" in asset_list:
             raise ValueError(f"Cannot get asset URL: {asset_list['error']}")
@@ -393,11 +419,11 @@ class SauceLabsAgent:
                 f"Asset '{asset_key}' not found in job {job_id}. Available assets: {list(asset_list.keys())}")
 
         if isinstance(asset_url, str):
-            return f"rest/v1/{self.username}/jobs/{job_id}/assets/{asset_url}"
+            return f"rest/v1/{username}/jobs/{job_id}/assets/{asset_url}"
         raise ValueError(f"Asset must be string, {asset_key} is type {type(asset_url)}")
 
     # This is exposed to the Agent in case the user wants to see the links that will click through to the Sauce UI
-    async def get_test_assets(self, job_id: str) -> Dict[str, Any]:
+    async def get_test_assets(self, auth: str, job_id: str) -> Dict[str, Any]:
         """
         Returns the list of all assets for a test, based on the job ID.
 
@@ -411,7 +437,9 @@ class SauceLabsAgent:
         :param job_id: The Sauce Labs Job ID (VDC jobs only).
         :return: JSON containing a list of assets, from which the URL can be derived.
         """
-        response = await self.sauce_api_call(f"rest/v1/jobs/{job_id}/assets")
+        response = await self.sauce_api_call(f"rest/v1/jobs/{job_id}/assets",  headers={
+            "Authorization": auth
+        })
         if isinstance(response, httpx.Response):
             if response.status_code == 200:
                 return response.json()
@@ -436,7 +464,7 @@ class SauceLabsAgent:
                 }
         return response
 
-    async def get_log_json_file(self, job_id: str) -> Union[List[Dict[str, Any]], Dict[str, str]]:
+    async def get_log_json_file(self, auth: str, job_id: str, username: str) -> Union[List[Dict[str, Any]], Dict[str, str]]:
         """
         Shows the complete log of a Sauce Labs test, in structured json format.
 
@@ -448,9 +476,10 @@ class SauceLabsAgent:
         get_specific_real_device_job_asset instead.
 
         :param job_id: The Sauce Labs Job ID (VDC jobs only).
+        :param username: Required. The unique identifier of user. Used to search user's account information.
         :return: Structured JSON log data with test commands, timing, and screenshots.
         """
-        asset_url: str = await self.get_asset_url(job_id, "sauce-log")
+        asset_url: str = await self.get_asset_url(auth, job_id, "sauce-log", username)
         sys.stderr.write(
             f"log.json url: {asset_url}\n"
         )
@@ -464,39 +493,39 @@ class SauceLabsAgent:
         return {"error": "Invalid response type"}
 
     # Not published in v1
-    async def get_selenium_log_file(self, job_id: str) -> Union[str, Dict[str, str]]:
+    async def get_selenium_log_file(self, auth: str, job_id: str) -> Union[str, Dict[str, str]]:
         """
         Shows the complete log of a Sauce Labs test, in unstructured raw format.
         """
-        asset_url = await self.get_asset_url(job_id, "selenium-server.log")
+        asset_url = await self.get_asset_url(auth, job_id, "selenium-server.log")
         response = await self.sauce_api_call(asset_url)
         if isinstance(response, httpx.Response):
             return response.json()
         return response
 
     # Not published in v1
-    async def get_network_har_file(self, job_id: str) -> Dict[str, str]:
+    async def get_network_har_file(self, auth: str, job_id: str) -> Dict[str, str]:
         """
         Returns the HAR file of network traffic gathered during the test, in structured json format.
         """
-        asset_url = await self.get_asset_url(job_id, "network.har")
+        asset_url = await self.get_asset_url(auth, job_id, "network.har")
         response = await self.sauce_api_call(asset_url)
         if isinstance(response, httpx.Response):
             return response.json()
         return response
 
     # Not published in v1
-    async def get_performance_json_file(self, job_id: str) -> Dict[str, str]:
+    async def get_performance_json_file(self, auth: str, job_id: str) -> Dict[str, str]:
         """
         Returns the Performance log of the test, in structured json format.
         """
-        asset_url = await self.get_asset_url(job_id, "performance.json")
+        asset_url = await self.get_asset_url(auth, job_id, "performance.json")
         response = await self.sauce_api_call(asset_url)
         if isinstance(response, httpx.Response):
             return response.json()
         return response
 
-    async def get_job_details(self, job_id: str) -> Dict[str, Any]:
+    async def get_job_details(self, auth: str, job_id: str, username: str) -> Dict[str, Any]:
         """
         Retrieves the execution details of a particular job, by ID.
 
@@ -508,9 +537,12 @@ class SauceLabsAgent:
             - If 'browser' field shows web browsers → VDC job → use get_test_assets for assets
 
         :param job_id: The Sauce Labs Job ID (works for both VDC and RDC jobs).
+        :param username: Required. The unique identifier of user. Used to search user's account information.
         :return: Detailed job information including status, timing, configuration, and platform-specific data.
         """
-        response = await self.sauce_api_call(f"rest/v1/{self.username}/jobs/{job_id}")
+        response = await self.sauce_api_call(f"rest/v1/{username}/jobs/{job_id}",  headers={
+            "Authorization": auth
+        })
         if response.status_code == 200:
             return response.json()
         elif response.status_code == 404:
@@ -538,17 +570,21 @@ class SauceLabsAgent:
             }
 
     async def get_recent_jobs(
-        self, limit: int = 5
+        self, auth: str, username: str, limit: int = 5
     ) -> Dict[str, Any]:
         """
         Retrieves a list of the most recent jobs run on Sauce Labs for the current user.
         Allows specifying the number of jobs to retrieve, up to a maximum.
         Useful for quickly checking the status of recent test runs.
+        :param username: Required. The unique identifier of user. Used to search user's account information.
         :param limit: The upper limit (integer) of jobs to retrieve. Max is 100
         """
         response = await self.sauce_api_call(
-            f"rest/v1/{self.username}/jobs",
-            params={"limit": limit}
+            f"rest/v1/{username}/jobs",
+            params={"limit": limit},
+            headers={
+                "Authorization": auth
+            }
         )
         if isinstance(response, httpx.Response):
             jobs = response.json()
@@ -564,6 +600,7 @@ class SauceLabsAgent:
 
     async def lookup_builds(
         self,
+        auth: str,
         build_source: str,
         user_id: Optional[str] = None,
         org_id: Optional[str] = None,
@@ -620,7 +657,9 @@ class SauceLabsAgent:
             params["sort"] = sort
 
         try:
-            response = await self.sauce_api_call(f"v2/builds/{build_source}/", params=params)
+            response = await self.sauce_api_call(f"v2/builds/{build_source}/", params=params,  headers={
+                "Authorization": auth
+            })
 
             if isinstance(response, dict):
                 return response
@@ -637,7 +676,7 @@ class SauceLabsAgent:
             else:
                 raise e
 
-    async def get_build(self, build_source: str, build_id: str) -> Dict[str, Any]:
+    async def get_build(self, auth: str, build_source: str, build_id: str) -> Dict[str, Any]:
         """
         Retrieve the details related to a specific build by passing its unique ID in the request.
         :param build_source: Required. The type of device for which you are getting builds. Valid values are: 'rdc' -
@@ -645,7 +684,9 @@ class SauceLabsAgent:
         :param build_id: Required. The unique identifier of the build to retrieve. You can look up build IDs in your
             organization using the Lookup Builds endpoint.
         """
-        response = await self.sauce_api_call(f"v2/builds/{build_source}/{build_id}/")
+        response = await self.sauce_api_call(f"v2/builds/{build_source}/{build_id}/",  headers={
+            "Authorization": auth
+        })
         if response.status_code == 404:
             return {
                 "error": f"Build not found: {build_id}",
@@ -665,7 +706,7 @@ class SauceLabsAgent:
         data = response.json()
         return data
 
-    async def get_build_for_job(self, build_source: str, job_id: str) -> Union[Dict[str, Any], ErrorResponse]:
+    async def get_build_for_job(self, auth: str, build_source: str, job_id: str) -> Union[Dict[str, Any], ErrorResponse]:
         """
         Retrieve the details related to a specific build by passing its unique ID in the request.
         :param build_source: Required. The type of device for which you are getting builds. Valid values are: 'rdc'
@@ -674,7 +715,9 @@ class SauceLabsAgent:
             IDs in your organization using the Get Jobs endpoint.
         """
         response = await self.sauce_api_call(
-            f"v2/builds/{build_source}/jobs/{job_id}/build/"
+            f"v2/builds/{build_source}/jobs/{job_id}/build/",  headers={
+                "Authorization": auth
+            }
         )
         if isinstance(response, httpx.Response):
             if response.status_code == 404:
@@ -698,6 +741,7 @@ class SauceLabsAgent:
 
     async def lookup_jobs_in_build(
         self,
+        auth: str,
         build_source: str,
         build_id: str,
         modified_since: Optional[str] = None,
@@ -769,7 +813,9 @@ class SauceLabsAgent:
             params["faulty"] = faulty
 
         response = await self.sauce_api_call(
-            f"v2/builds/{build_source}/{build_id}/jobs/", params=params
+            f"v2/builds/{build_source}/{build_id}/jobs/", params=params,  headers={
+                "Authorization": auth
+            }
         )
         if isinstance(response, httpx.Response):
             if response.status_code == 200:
@@ -818,14 +864,16 @@ class SauceLabsAgent:
 
     ################################## Sauce Connect endpoints
 
-    async def get_tunnels_for_user(self, username) -> Dict[str, Any]:
+    async def get_tunnels_for_user(self, auth: str, username) -> Dict[str, Any]:
         """
         Returns Tunnel IDs or Tunnels Info for any currently running tunnels launched by or shared with the specified
         user. The word "tunnel" in this context refers to usage of the Sauce Connect tool.
         It also allows to filter tunnels using an optional "filter" parameter that may take the following values:
         :param username: Required. The authentication username of the user whose tunnels you are requesting.
         """
-        response = await self.sauce_api_call(f"rest/v1/{username}/tunnels")
+        response = await self.sauce_api_call(f"rest/v1/{username}/tunnels",  headers={
+            "Authorization": auth
+        })
         if isinstance(response, httpx.Response):
             if response.status_code == 404:
                 return {"error": "User not found"}
@@ -842,7 +890,7 @@ class SauceLabsAgent:
         return {"tunnels": response, "count": len(response), "username": username}
 
     async def get_tunnel_information(
-        self, username: str, tunnel_id: str
+        self, auth: str, username: str, tunnel_id: str
     ) -> Dict[str, Any]:
         """
         Returns information about the specified tunnel. The word "tunnel" in this context refers to usage of \
@@ -850,10 +898,12 @@ class SauceLabsAgent:
         :param username: Required. The authentication username of the owner of the requested tunnel.
         :param tunnel_id: Required. The unique identifier of the requested tunnel.
         """
-        response = await self.sauce_api_call(f"rest/v1/{username}/tunnels/{tunnel_id}")
+        response = await self.sauce_api_call(f"rest/v1/{username}/tunnels/{tunnel_id}",  headers={
+            "Authorization": auth
+        })
         return self.process_tunnel_response(response, tunnel_id, username)
 
-    async def get_tunnel_version_downloads(self, client_version: str) -> Dict[str, Any]:
+    async def get_tunnel_version_downloads(self, auth: str, client_version: str) -> Dict[str, Any]:
         """
         Returns the specific paths (URLs) to download specific versions of the SauceConnect tunnel software.
         The word "tunnel" in this context refers to usage of the Sauce Connect tool.
@@ -861,13 +911,15 @@ class SauceLabsAgent:
             version (For example, '5.2.3').
         """
         response = await self.sauce_api_call(
-            f"rest/v1/public/tunnels/info/versions?client_version={client_version}"
+            f"rest/v1/public/tunnels/info/versions?client_version={client_version}",  headers={
+                "Authorization": auth
+            }
         )
         data = response.json()
         return data
 
     async def get_current_jobs_for_tunnel(
-        self, username: str, tunnel_id: str
+        self, auth: str, username: str, tunnel_id: str
     ) -> Dict[str, Any]:
         """
         Returns the number of currently running jobs for the specified tunnel. The word "tunnel" in this context refers
@@ -875,7 +927,9 @@ class SauceLabsAgent:
         :param username: Required. The authentication username of the owner of the requested tunnel.
         :param tunnel_id: Required. The unique identifier of the requested tunnel.
         """
-        response = await self.sauce_api_call(f"rest/v1/{username}/tunnels/{tunnel_id}/num_jobs")
+        response = await self.sauce_api_call(f"rest/v1/{username}/tunnels/{tunnel_id}/num_jobs",  headers={
+            "Authorization": auth
+        })
 
         return self.process_tunnel_response(response, tunnel_id, username)
 
@@ -909,17 +963,19 @@ class SauceLabsAgent:
         return response
 
     ################################## Real Device endpoints
-    async def get_specific_device(self, device_id:str) -> Dict[str, Any]:
+    async def get_specific_device(self, auth: str, device_id:str) -> Dict[str, Any]:
         """
         Get information about the device specified in the request.
         :param device_id: Required. The unique identifier of a device in the Sauce Labs
             data center. Use the 'descriptor' value from get_devices_status results.
         """
-        response = await self.sauce_api_call(f"v1/rdc/devices/{device_id}")
+        response = await self.sauce_api_call(f"v1/rdc/devices/{device_id}",  headers={
+            "Authorization": auth
+        })
         data = response.json()
         return data
 
-    async def get_devices_status(self) -> Dict[str, Any]:
+    async def get_devices_status(self, auth: str) -> Dict[str, Any]:
         """
         Returns a list of devices in the data center along with their current states. Each device is represented by a
         descriptor, indicating its model, and includes information on availability, usage status, and whether it is
@@ -942,12 +998,14 @@ class SauceLabsAgent:
         Note: The 'descriptor' field in each device object is the device identifier that should be used as the
         'device_id' parameter in get_specific_device calls.
         """
-        response = await self.sauce_api_call(f"v1/rdc/devices/status")
+        response = await self.sauce_api_call(f"v1/rdc/devices/status",  headers={
+            "Authorization": auth
+        })
         data = response.json()
         return data
 
     ################################## Real Device Jobs endpoints
-    async def get_real_device_jobs(self, limit: int = 5, offset: int = 1, type: str = None) -> Dict[str, Any]:
+    async def get_real_device_jobs(self, auth: str, limit: int = 5, offset: int = 1, type: str = None) -> Dict[str, Any]:
         """
         Get a list of jobs that are actively running on real devices in the data center.
         :param limit: The maximum number of jobs to return.
@@ -955,21 +1013,25 @@ class SauceLabsAgent:
         :param type: Filter results to show manual tests only with LIVE.
         """
         response = await self.sauce_api_call(f"v1/rdc/jobs",
-             params={"limit": limit, "offset": offset})
+             params={"limit": limit, "offset": offset},  headers={
+                "Authorization": auth
+            })
         data = response.json()
         return data
 
-    async def get_specific_real_device_job(self, job_id: str) -> Dict[str, Any]:
+    async def get_specific_real_device_job(self, auth: str, job_id: str) -> Dict[str, Any]:
         """
         Get information about a specific job running on a real device at the data center.
         :param job_id: Required. The unique identifier of a job running on a real device in the data center. You can
             look up job IDs using the Get Real Device Jobs endpoint.
         """
-        response = await self.sauce_api_call(f"v1/rdc/jobs/{job_id}")
+        response = await self.sauce_api_call(f"v1/rdc/jobs/{job_id}",  headers={
+            "Authorization": auth
+        })
         data = response.json()
         return data
 
-    async def get_specific_real_device_job_asset(self, job_id: str, asset_type: str) -> Dict[str, Any]:
+    async def get_specific_real_device_job_asset(self, auth: str, job_id: str, asset_type: str) -> Dict[str, Any]:
         """
         Download a specific asset for a Real Device Cloud (RDC) job.
 
@@ -997,7 +1059,9 @@ class SauceLabsAgent:
             'insights.json' - Device Vitals | Appium, Espresso, XCUITest
             'crash.json' - Crash Logs | Appium
         """
-        response = await self.sauce_api_call(f"v1/rdc/jobs/{job_id}/{asset_type}")
+        response = await self.sauce_api_call(f"v1/rdc/jobs/{job_id}/{asset_type}",  headers={
+            "Authorization": auth
+        })
         if response.status_code == 200:
             return {
                 "content": base64.b64encode(response.content).decode('utf-8'),
@@ -1009,78 +1073,89 @@ class SauceLabsAgent:
         data = response.json()
         return data
 
-    async def get_private_devices(self) -> Dict[str, Any]:
+    async def get_private_devices(self, auth: str) -> Dict[str, Any]:
         """
         Get a list of private devices with their device information and settings.
         """
-        response = await self.sauce_api_call(f"v1/rdc/device-management/devices")
+        response = await self.sauce_api_call(f"v1/rdc/device-management/devices",  headers={
+            "Authorization": auth
+        })
         data = response.json()
         return {"devices": data}
 
     ################################## Storage endpoints
     # Not published as of v1
-    async def get_storage_files(self) -> Dict[str, Any]:
+    async def get_storage_files(self, auth: str) -> Dict[str, Any]:
         """
         Returns the set of files that have been uploaded to Sauce Storage by the requestor.
         """
-        response = await self.sauce_api_call("v1/storage/files")
+        response = await self.sauce_api_call("v1/storage/files",  headers={
+            "Authorization": auth
+        })
         data = response.json()
         return data
 
-    async def get_storage_groups(self) -> Dict[str, Any]:
+    async def get_storage_groups(self, auth: str) -> Dict[str, Any]:
         """
         Returns an array of groups (apps containing multiple files) currently in storage for the authenticated requestor.
         """
-        response = await self.sauce_api_call("v1/storage/groups")
+        response = await self.sauce_api_call("v1/storage/groups",  headers={
+            "Authorization": auth
+        })
         data = response.json()
         return data
 
-    async def get_storage_groups_settings(self, group_id: str) -> Dict[str, Any]:
+    async def get_storage_groups_settings(self, auth: str, group_id: str) -> Dict[str, Any]:
         """
         Returns the settings of an app group with the given ID.
         :param group_id: The unique identifier of the app group. You can look up group IDs using the Get App Storage Groups endpoint.
         """
-        response = await self.sauce_api_call(f"v1/storage/groups/{group_id}/settings")
+        response = await self.sauce_api_call(f"v1/storage/groups/{group_id}/settings",  headers={
+            "Authorization": auth
+        })
         data = response.json()
         return data
 
-# If run directly from a TTY, this server could be compromised (STDIO hijacking, etc)
-def check_stdio_is_not_tty():
-    """
-    Checks if stdin, stdout, and stderr are not connected to a TTY.
-    Returns True if safe, False otherwise.
-    """
-    if sys.stdin.isatty() or sys.stdout.isatty() or sys.stderr.isatty():
-        print("Error: This server is not meant to be run interactively.", file=sys.stderr)
-        return False
-    return True
 
-def main():
-    if not check_stdio_is_not_tty():
-        sys.exit(1)
+app = FastAPI(title="Sauce API MCP Server")
 
-    # Create the FastMCP server instance
-    mcp_server_instance = FastMCP("SauceLabsAgent")
+mcp_instance = None
+tool_schemas = []
+tool_map = {}
 
-    import os
 
-    SAUCE_ACCESS_KEY = os.getenv("SAUCE_ACCESS_KEY")
-    if SAUCE_ACCESS_KEY is None:
-        raise ValueError("SAUCE_ACCESS_KEY environment variable is not set.")
+@app.on_event("startup")
+async def startup_event():
+    global mcp_instance, tool_schemas, tool_map
 
-    SAUCE_USERNAME = os.getenv("SAUCE_USERNAME")
-    if SAUCE_USERNAME is None:
-        raise ValueError("SAUCE_USERNAME environment variable is not set.")
+    mcp_instance = FastMCP("SauceLabsAgent")
 
-    SAUCE_REGION = os.getenv("SAUCE_REGION")
-    if SAUCE_REGION is None:
-        SAUCE_REGION = "US_WEST"
+    SauceLabsAgent(mcp_instance, SAUCE_REGION)
 
-    sauce_agent = SauceLabsAgent(mcp_server_instance, SAUCE_ACCESS_KEY, SAUCE_USERNAME, SAUCE_REGION)
+    for tool in await mcp_instance.list_tools():
+        dict_tool = {**tool.dict(), "parameters": tool.dict()["inputSchema"]}
+        del dict_tool["inputSchema"]
+        tool_schemas.append(dict_tool)
 
-    # Run the FastMCP server instance
-    mcp_server_instance.run(transport="stdio")
 
-# --- Main Application Setup ---
-if __name__ == "__main__":
-    main()
+    print(f"Successfully loaded {len(tool_schemas)} tools.")
+
+@app.get("/tools", response_model=List[dict])
+async def get_tools():
+    return tool_schemas
+
+
+@app.post("/execute")
+async def execute_tool(request: ToolExecutionRequest):
+    try:
+        print("Tool name", request.tool_name)
+        print("Parameters", request.parameters)
+        result = await mcp_instance.call_tool(
+            request.tool_name,
+            request.parameters
+        )
+        # TODO review
+        return result[1]
+    except Exception as e:
+        print("Error during executing", e)
+        raise HTTPException(status_code=500, detail=str(e))

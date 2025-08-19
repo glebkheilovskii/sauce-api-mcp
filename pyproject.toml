@@ -10,7 +10,8 @@ requires-python = ">=3.10"
 dependencies = [
     "httpx",
     "pydantic",
-    "mcp"
+    "mcp",
+    "fastapi"
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
