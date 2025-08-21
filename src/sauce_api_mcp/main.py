@@ -1,7 +1,10 @@
 import base64
+import re
 
+import dateparser
 from mcp.server import FastMCP
 from typing import Dict, Any, Union, Optional, List  # For type hinting dicts
+from datetime import datetime, timedelta
 import os
 import httpx
 import sys
@@ -29,6 +32,14 @@ logging.basicConfig(
     stream=sys.stderr,
     format=">>>>>>>>>>>>%(levelname)s: %(message)s",
 )
+
+def _get_start_of_day(dt: datetime) -> datetime:
+    """Returns the beginning of the day for a given datetime object."""
+    return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+def _get_end_of_day(dt: datetime) -> datetime:
+    """Returns the end of the day for a given datetime object."""
+    return dt.replace(hour=23, minute=59, second=59, microsecond=999999)
 
 class ToolExecutionRequest(BaseModel):
     tool_name: str
@@ -100,6 +111,13 @@ class SauceLabsAgent:
         self.mcp.tool()(self.get_specific_real_device_job)
         self.mcp.tool()(self.get_specific_real_device_job_asset)
         self.mcp.tool()(self.get_private_devices)
+
+        ### Insights
+        self.mcp.tool()(self.get_all_available_jobs)
+        self.mcp.tool()(self.get_test_cases_stats)
+
+        ### Helper tools
+        self.mcp.tool()(self.convert_timestamps_for_ms_period)
 
         logging.info("SauceAPI client initialized and resource manifest loaded.")
 
@@ -758,7 +776,8 @@ class SauceLabsAgent:
     ) -> Dict[str, Any]:
         """
         Returns information about all jobs associated with the specified build. You can limit which jobs are
-        returned using any of the optional filtering parameters.
+        returned using any of the optional filtering parameters. Use this tool only to discover which jobs related to the build but
+        never return its data to user
         :param build_source: Required. The type of test device associated with the build and its jobs. Valid values are:
             rdc - Real Device Builds, vdc - Emulator or Simulator Builds
         :param build_id: Required. The unique identifier of the build whose jobs you are looking up. You can look up
@@ -1116,6 +1135,257 @@ class SauceLabsAgent:
         data = response.json()
         return data
 
+    ################################## Insights endpoints
+    async def get_test_cases_stats(
+            self,
+            auth: str,
+            org_id: str,
+            start_date: int,
+            end_date: int,
+            include_previous_period: Optional[bool] = None,
+            build: Optional[list[str]] = None,
+            device: Optional[list[str]] = None,
+            browser: Optional[list[str]] = None,
+            device_group: Optional[list[str]] = None,
+            framework: Optional[list[str]] = None,
+            os: Optional[list[str]] = None,
+            source: Optional[list[str]] = None,
+            tag: Optional[list[str]] = None,
+            tag_filter_mode: Optional[str] = None,
+            team_id: Optional[str] = None,
+            user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Calculates and returns key statistics for test cases within a specific date range.
+        Use this tool to find out the total number of flaky tests or provide overview statistic or test case statistic trends
+        It provides a direct count of flaky test cases for the given period.
+        Returns JSON containing 'data' and 'data_previous_period' (if applicable) objects. Each of the object contains 'consistently_*' (complete, error, failing, passing), 'total_test_cases', 'total_flaky_test_cases' properties
+        :param org_id: Required. The user organization id.
+        :param start_date: Required. The start date for the range of test case statistic.
+        :param end_date: Required. The end date for the range of test case statistic
+        :param include_previous_period: Optional. Indicator weather endpoint should return stats for the previous period for trends providing.
+        :param build: Optional. A comma-separated list of build names to filter the test cases.
+        :param device: Optional. A comma-separated list of devices to filter the test cases.
+        :param browser: Optional. A comma-separated list of browsers to filter the test cases. E.g. Chrome to get all Chrome test cases, Chrome__111.0 to get specific Chrome version test cases.
+        :param device_group: Optional. A comma-separated list of device group to filter the test cases. Available values ('private', 'public')
+        :param framework: Optional. A comma-separated list of testing framework to filter (e.g. webdriver, selenium, playwright) the test case.
+        :param os: Optional. A comma-separated list of operating systems to filter the test cases. E.g. Windows to get all Windows test cases, Windows__11 to get specific Windows version test cases.
+        :param source: Optional. A comma-separated list of sources ('vdc', 'rdc') to filter the test cases.
+        :param tag: Optional. A comma-separated list of tags to filter the test cases.
+        :param tag_filter_mode:
+        :param team_id: Optional. A team IDs to filter the test cases.
+        :param user_id: Optional. An owner user ID to filter the test cases.
+        :return:
+        """
+        params: dict[str, Any] = {
+            "org_id": org_id,
+            "start_date": start_date,
+            "end_date": end_date
+        }
+        if include_previous_period is not None:
+            params["include_previous_period"] = include_previous_period
+        if build:
+            params["build"] = ",".join(build)
+        if device:
+            params["device"] = ",".join(device)
+        if browser:
+            params["browser"] = ",".join(browser)
+        if device_group:
+            params["device_group"] = ",".join(device_group)
+        if framework:
+            params["framework"] = ",".join(framework)
+        if os:
+            params["os"] = ",".join(os)
+        if source:
+            params["source"] = ",".join(source)
+        if tag:
+            params["tag"] = ",".join(tag)
+        if tag_filter_mode:
+            params["tag_filter_mode"] = tag_filter_mode
+        if team_id:
+            params["team_id"] = team_id
+        if user_id:
+            params["user_id"] = user_id
+
+
+        response = await self.sauce_api_call(f"insights/v3/test-cases/stats",
+                                             params=params,
+                                             headers={
+            "Authorization": auth
+        })
+        data = response.json()
+        return data
+
+    async def get_all_available_jobs(
+            self,
+            auth: str,
+            start_date: int,
+            end_date: Optional[int] = None,
+            job_id: Optional[str] = None,
+            source: Optional[list[str]] = None,
+            size: Optional[int] = None,
+            status: Optional[list[str]] = None,
+            browser: Optional[list[str]] = None,
+            build_name: Optional[list[str]] = None,
+            device: Optional[list[str]] = None,
+            name: Optional[str] = None,
+            name_match: Optional[str] = None,
+            os: Optional[list[str]] = None,
+            owner_id: Optional[list[str]] = None,
+            team_id: Optional[list[str]] = None,
+            run_mode: Optional[list[str]] = None,
+            tunnel_id: Optional[str] = None,
+            tag: Optional[list[str]] = None,
+            has_crashed: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """
+        Retrieves detailed information, including 'duration', for a specific list of job IDs.
+        Use this tool when you have job IDs and need to find out other jobs-related data,
+        their status, or other specific details. This is the only tool that provides job duration.
+        Returns the following jobs information 'id', 'creation_time_ms', 'status', 'name', 'duration', 'os', 'os_version', 'team_id', 'owner_id', 'build_name', 'tags', 'device', 'run_mode', 'tunnel_id', 'has_crashed', 'browser'
+        :param start_date: Required. The start date for the range of jobs.
+        :param end_date: Optional. The end date for the range of jobs. If nothing set then current datetime is assumed.
+        :param job_id: Optional. A comma-separated list of job IDs to retrieve.
+        :param source: Optional. A comma-separated list of sources ('vdc', 'rdc', 'api') to filter the jobs.
+        :param size: Optional. The number of jobs to return.
+        :param status: Optional. A comma-separated list of statuses ('complete', 'queued', 'error', 'failed', 'in progress', 'new', 'passed') to filter the jobs.
+        :param browser: Optional. A comma-separated list of browsers to filter the jobs. E.g. Chrome to get all Chrome jobs, Chrome__111.0 to get specific Chrome version jobs.
+        :param build_name: Optional. A comma-separated list of build names to filter the jobs.
+        :param device: Optional. A comma-separated list of devices to filter the jobs.
+        :param name: Optional. The job name to filter the jobs.
+        :param name_match: Optional. The job name match pattern to filter the jobs. Helpful for partial jobs name search.
+        :param os: Optional. A comma-separated list of operating systems to filter the jobs. E.g. Windows to get all Windows jobs, Windows__11 to get specific Windows version jobs.
+        :param owner_id: Optional. A comma-separated list of owner user IDs to filter the jobs.
+        :param team_id: Optional. A comma-separated list of team IDs to filter the jobs.
+        :param run_mode: Optional. A comma-separated list of run modes ('automatic', 'manual', 'scheduled', 'ondemand') to filter the jobs.
+        :param tunnel_id: Optional. The tunnel ID to filter the jobs.
+        :param tag: Optional. A comma-separated list of tags to filter the jobs.
+        :param has_crashed: Optional. Filter jobs that have crashed.
+        """
+        params: dict[str, Any] = {
+            "start_date": start_date
+        }
+        if end_date:
+            params["end_date"] = end_date
+        if job_id:
+            params["job_id"] = ",".join(job_id)
+        if source:
+            params["source"] = ",".join(source)
+        if size:
+            params["size"] = size
+        if status:
+            params["status"] = ",".join(status)
+        if browser:
+            params["browser"] = ",".join(browser)
+        if build_name:
+            params["build_name"] = ",".join(build_name)
+        if device:
+            params["device"] = ",".join(device)
+        if name:
+            params["name"] = name
+        if name_match:
+            params["name_match"] = name_match
+        if os:
+            params["os"] = ",".join(os)
+        if owner_id:
+            params["owner_id"] = ",".join(owner_id)
+        if team_id:
+            params["team_id"] = ",".join(team_id)
+        if run_mode:
+            params["run_mode"] = ",".join(run_mode)
+        if tunnel_id:
+            params["tunnel_id"] = ",".join(tunnel_id)
+        if tag:
+            params["tag"] = ",".join(tag)
+        if has_crashed is not None:
+            params["has_crashed"] = has_crashed
+
+        response = await self.sauce_api_call(f"v2/archives/jobs",
+                                             params=params,
+                                             headers={
+                                                 "Authorization": auth
+                                             })
+        data = response.json()
+        return data
+
+    ################################## Helper functions
+    def convert_timestamps_for_ms_period(self, period: str) -> dict:
+        """
+          Converts a flexible, human-readable date or date range into start and end timestamps.
+          Handles single dates ("yesterday", "Aug 15 2025"), relative ranges ("last 3 days"),
+          and explicit ranges ("29-30 of July 2025", "August 1 to August 5 2025").
+          """
+        now = datetime.utcnow()
+        period_lower = period.lower()
+        start_date_dt = None
+        end_date_dt = None
+
+        range_separators = [' to ', '-', ' and ']
+        separator_found = None
+        for sep in range_separators:
+            if sep in period_lower:
+                separator_found = sep
+                break
+
+        if separator_found:
+            parts = period.split(separator_found)
+            if len(parts) == 2:
+                start_str, end_str = parts
+                if len(end_str.strip().split()) == 1:
+                    month_year_part = " ".join(start_str.strip().split()[1:])
+                    end_str = f"{end_str.strip()} {month_year_part}"
+
+                start_date_dt = dateparser.parse(start_str, settings={'PREFER_DATES_FROM': 'past'})
+                end_date_dt = dateparser.parse(end_str, settings={'PREFER_DATES_FROM': 'past'})
+
+                if start_date_dt and end_date_dt:
+                    return {
+                        "start_date": int(_get_start_of_day(start_date_dt).timestamp()),
+                        "end_date": int(_get_end_of_day(end_date_dt).timestamp())
+                    }
+
+        match = re.match(r'last (\d+) (day|week|month)s?', period_lower)
+        if match:
+            quantity = int(match.group(1))
+            unit = match.group(2)
+
+            end_date_dt = now
+            if unit == 'day':
+                start_date_dt = now - timedelta(days=quantity)
+            elif unit == 'week':
+                start_date_dt = now - timedelta(weeks=quantity)
+            elif unit == 'month':
+                start_date_dt = now - timedelta(days=30 * quantity)
+
+        elif "today" in period_lower:
+            start_date_dt = _get_start_of_day(now)
+            end_date_dt = _get_end_of_day(now)
+        elif "yesterday" in period_lower:
+            yesterday = now - timedelta(days=1)
+            start_date_dt = _get_start_of_day(yesterday)
+            end_date_dt = _get_end_of_day(yesterday)
+        elif "this week" in period_lower:
+            start_of_week = now - timedelta(days=now.weekday()) # Monday
+            start_date_dt = _get_start_of_day(start_of_week)
+            end_date_dt = _get_end_of_day(start_of_week + timedelta(days=6))
+        elif "last week" in period_lower:
+            end_of_last_week = now - timedelta(days=now.weekday() + 1)
+            start_of_last_week = end_of_last_week - timedelta(days=6)
+            start_date_dt = _get_start_of_day(start_of_last_week)
+            end_date_dt = _get_end_of_day(end_of_last_week)
+
+        if start_date_dt is None:
+            parsed_date = dateparser.parse(period, settings={'PREFER_DATES_FROM': 'past'})
+            if parsed_date:
+                start_date_dt = _get_start_of_day(parsed_date)
+                end_date_dt = _get_end_of_day(parsed_date)
+            else:
+                return {"error": f"Could not understand the date period: {period}"}
+
+        return {
+            "start_date": int(start_date_dt.timestamp()),
+            "end_date": int(end_date_dt.timestamp())
+        }
 
 app = FastAPI(title="Sauce API MCP Server")
 
@@ -1129,6 +1399,8 @@ async def startup_event():
     global mcp_instance, tool_schemas, tool_map
 
     mcp_instance = FastMCP("SauceLabsAgent")
+
+    SAUCE_REGION = "OTHER"
 
     SauceLabsAgent(mcp_instance, SAUCE_REGION)
 
@@ -1148,14 +1420,10 @@ async def get_tools():
 @app.post("/execute")
 async def execute_tool(request: ToolExecutionRequest):
     try:
-        print("Tool name", request.tool_name)
-        print("Parameters", request.parameters)
-        result = await mcp_instance.call_tool(
+        return await mcp_instance.call_tool(
             request.tool_name,
             request.parameters
         )
-        # TODO review
-        return result[1]
     except Exception as e:
         print("Error during executing", e)
         raise HTTPException(status_code=500, detail=str(e))

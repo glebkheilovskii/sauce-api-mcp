@@ -11,7 +11,8 @@ dependencies = [
     "httpx",
     "pydantic",
     "mcp",
-    "fastapi"
+    "fastapi",
+    "dateparser"
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
